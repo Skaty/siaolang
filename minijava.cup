@@ -1,0 +1,964 @@
+/* Minijava Grammar */
+
+import java_cup.runtime.ComplexSymbolFactory;
+import java_cup.runtime.ScannerBuffer;
+
+import java.io.*;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+
+parser code {:
+  public static TypecheckerState state = new TypecheckerState();
+  public static ErrorManager typeErrors = new ErrorManager();
+
+  public Parser(Lexer lex, ComplexSymbolFactory sf) {
+    super(lex,sf);
+  }
+
+  public static String clsFdMdTypecheck(Location loc, String classname, String id) {
+    CDesc cdec = state.classdescriptor.getOrDefault(classname, null);
+
+    if (cdec == null) {
+      Parser.addError(
+        "%s is not a valid class!",
+        loc,
+        loc,
+        classname
+      );
+      state.typestack.push(Utils.ParserTypes.INVALID.getValue());
+      return Utils.ParserTypes.INVALID.getValue();
+    }
+
+    String fdtype = cdec.fds.getOrDefault(id, null);
+
+    if (fdtype != null) {
+      state.typestack.push(fdtype);
+      return fdtype;
+    }
+
+    // Check for msigs
+    HashMap<String, String> msig = cdec.msigs.getOrDefault(id, null);
+
+    if (msig != null) {
+      state.typestack.push(Utils.ParserTypes.METHOD.getValue());
+      state.msigstack.push(msig);
+      return classname;
+    }
+
+    Parser.addError(
+      "%s is a not a valid identifier!",
+      loc,
+      loc,
+      id
+    );
+    state.typestack.push(Utils.ParserTypes.INVALID.getValue()); // deque does not allow nulls
+    return Utils.ParserTypes.INVALID.getValue();
+  }
+
+  public static String idMdTypecheck(Location loc, String id) {
+    state.isWithinClass = false;
+    String fdtype = state.curVDecls.getOrDefault(id, state.curFml.getOrDefault(id, null));
+
+    if (fdtype == null) {
+      // Check within class
+      state.isWithinClass = true;
+      return clsFdMdTypecheck(loc, state.getCurrentClass(), id);
+    } else {
+      state.typestack.push(fdtype);
+      return fdtype;
+    }
+  }
+
+  public static String mdCallTypecheck(Node line, Location loc, int numargs) {
+    String msig = getMsigFromStack(numargs);
+    String itype = state.typestack.pollFirst();
+    if (itype != Utils.ParserTypes.METHOD.getValue()) {
+      state.typestack.push(itype);
+      Parser.addError(
+        "Call %s is calling a non-callable object! Type: %s",
+        loc,
+        loc,
+        line,
+        itype
+      );
+      return Utils.ParserTypes.INVALID.getValue();
+    }
+
+    HashMap<String, String> msigs = state.msigstack.pollFirst();
+    String rtype = msigs.getOrDefault(msig, Utils.ParserTypes.INVALID.getValue());
+
+    if (rtype.equals(Utils.ParserTypes.INVALID.getValue())) {
+      state.typestack.push(Utils.ParserTypes.INVALID.getValue());
+      Parser.addError(
+        "Call %s is calling to a method that doesn't exist!",
+        loc,
+        loc,
+        line
+      );
+      return Utils.ParserTypes.INVALID.getValue();
+    }
+
+    state.typestack.push(rtype);
+    return String.format("%s_%s", rtype, msig);
+  }
+
+  public static String getMsigFromStack(int length) {
+    String[] tokens = new String[length];
+
+    // populate backwards
+    for (int i = length - 1; i >= 0; i--) {
+      tokens[i] = state.typestack.pollFirst();
+    }
+
+    return Utils.getLocalMsig(tokens);
+  }
+
+  public static String arithTypecheck(Node var, Location loc, String rtype) {
+    String rsecond = state.typestack.pollFirst();
+    String rfirst = state.typestack.pollFirst();
+    state.typestack.push(rtype);
+
+    if (rsecond != rfirst || rfirst != Utils.ParserTypes.INT.getValue()) {
+      Parser.addError(
+        "Arithmetric operator in %s can only operate on int. Left type: %s, Right type: %s",
+        loc,
+        loc,
+        var,
+        rfirst,
+        rsecond
+      );
+    }
+
+    return rtype;
+  }
+
+  public static String boolTypecheck(Node var, Location loc) {
+    String rsecond = state.typestack.pollFirst();
+    String rfirst = state.typestack.pollFirst();
+    state.typestack.push(Utils.ParserTypes.BOOL.getValue());
+
+    if (rsecond != rfirst || rfirst != Utils.ParserTypes.BOOL.getValue()) {
+      Parser.addError(
+        "Boolean operator in %s can only operate on bool. Left type: %s, Right type: %s",
+        loc,
+        loc,
+        var,
+        rfirst,
+        rsecond
+      );
+    }
+
+    return Utils.ParserTypes.BOOL.getValue();
+  }
+
+  public static void addError(String fmt, Location left, Location right, Object... args) {
+    Parser.typeErrors.addError(
+      state.getCurrentClass(), state.getCurrentMethod(), fmt, left, right, args
+    );
+  }
+
+  /**
+   * Runs the first pass of the Parser.
+   * This does Parsing and collects the tokens for Class Descriptor
+   * and performs distinct name checking.
+   */
+  private static Node runFirstPass(String file) throws Exception {
+    ComplexSymbolFactory csf = new ComplexSymbolFactory();
+    ScannerBuffer lexer = new ScannerBuffer(new Lexer(new BufferedReader(new FileReader(file)),csf));
+    Parser p = new Parser(lexer, csf);
+    return (Node)p.parse().value;
+  }
+
+  /**
+   * Runs the second pass of the Parser
+   * Does typechecking for the parsed syntax
+   */
+  private static Node runSecondPass(String file) throws Exception {
+    state.initTypecheckPhase();
+
+    ComplexSymbolFactory csf = new ComplexSymbolFactory();
+    ScannerBuffer lexer = new ScannerBuffer(new Lexer(new BufferedReader(new FileReader(file)),csf));
+    Parser p = new Parser(lexer, csf);
+
+    return (Node)p.parse().value;
+  }
+
+  public static void main(String[] args) throws Exception {
+    String filename = "";
+    boolean optimize = false;
+
+    if (args.length == 1) {
+      filename = args[0];
+    } else if (args.length == 2) {
+      optimize = args[0].equals("-O");
+      filename = args[1];
+    }
+
+    Parser.runFirstPass(filename);
+
+    // Check for any errors
+    if (typeErrors.hasErrors()) {
+      typeErrors.printAll();
+      return;
+    }
+
+    Node programNode = Parser.runSecondPass(filename);
+
+    // Check for any errors
+    if (typeErrors.hasErrors()) {
+      typeErrors.printAll();
+      return;
+    }
+
+    IR3 ir3Tree = IR3Gen.fromAST(programNode, optimize);
+    System.err.println(ir3Tree);
+
+    String asm = CodeGen.fromIR3(ir3Tree);
+
+    if (!optimize) {
+      System.out.println(asm);
+    } else {
+      System.out.println(Peephole.run(asm));
+    }
+  }
+:};
+
+// terminals
+
+// keywords
+terminal CLASS, MAIN;
+terminal TINT, TBOOL, TSTRING, TVOID;
+
+terminal IF, ELSE, RETURN;
+terminal WHILE;
+terminal DOT, THIS, NEW, NULL;
+
+// built-in
+terminal READLN, PRINTLN;
+
+// boolean
+terminal BOR, BAND, LT, GT, LEQ, GEQ, DEQ, EQ, NEQ, NOT;
+terminal TRUE, FALSE;
+
+terminal Integer INTCONST;
+terminal String IDENTIFIER, CNAME, STRINGLITERAL;
+terminal SEMICOLON, COMMA;
+terminal PLUS, MINUS, TIMES, DIV;
+terminal LPAREN, RPAREN, UMINUS;
+terminal LBRACE, RBRACE;
+
+// non-terminals
+non terminal Node type;
+non terminal Node program, main_class;
+non terminal ArrayList<Node> class_decl, md_decls;
+non terminal Node class_body;
+non terminal Node md_decl, md_body;
+non terminal ArrayList<Node> var_decls_opt, var_decls;
+non terminal ArrayList<Node> fml_list, fml_rest;
+non terminal Node ftr_no_atom, ftr, stmts_opt, stmt, stmts;
+non terminal Node atom, var_decl;
+
+// expressions
+non terminal ArrayList<Node> expr_lst, expr_rest;
+non terminal Node expr, sexpr;
+non terminal Node aexpr, aexpr_loop, aexpr_or_atom, aexpr_list;
+non terminal Node bexpr, bexpr_loop, bexpr_list, rexpr, rexpr_no_atom;
+non terminal Node bop, bopexpr;
+non terminal Node bgrd, bgrd_no_atom, bgrd_not_loop, bgrd_truths;
+
+// precedence
+precedence left SEMICOLON;
+precedence left PLUS, MINUS;
+precedence left TIMES, DIV;
+precedence left BOR;
+precedence left BAND;
+precedence left UMINUS;
+
+program ::= main_class:m class_decl:cl
+    {:
+      cl.add(0, m);
+      RESULT = new Node(Node.NodeType.Program, cl);
+    :}
+    ;
+
+// class <cname> { Void main ( <FmlList> ) <MdBody> }
+main_class ::=
+    CLASS CNAME:n LBRACE TVOID MAIN LPAREN fml_list:fml RPAREN md_body:body RBRACE
+      {:
+        if (!state.secondrun) {
+          state.cnames.add(n);
+          state.mnames.add(new Pair<String, String>("main", Utils.ParserTypes.VOID.getValue()));
+          CDesc maindesc = state.classdescriptor.getOrDefault(n, new CDesc());
+          maindesc.addMsig(n, "main", Utils.getLocalMsig(state.fmlTypes.toArray(new String[0])), Utils.ParserTypes.VOID.getValue());
+          state.classdescriptor.putIfAbsent(n, maindesc);
+        }
+
+        if (state.secondrun) {
+          String rtype = state.typestack.pollFirst();
+        }
+
+        state.classptr++;
+        state.methodptr++;
+
+        Node fmlNode = new Node(Node.NodeType.FmlList, fml);
+        Node mname = new Node(Node.NodeType.MName, "main");
+        Node type = new Node(Node.NodeType.Type, Utils.ParserTypes.VOID.getValue());
+
+        Node main = new Node(Node.NodeType.MDecl, type, mname, fmlNode, body);
+        main.note = "_main_";
+        RESULT = new Node(
+          Node.NodeType.CDecl,
+          new Node(Node.NodeType.CName, n),
+          new Node(Node.NodeType.Block, main)
+        );
+      :}
+    ;
+
+// class <cname> { <VarDecl>* <MdDecl>* }
+class_decl ::= class_decl:rst CLASS CNAME:n LBRACE class_body:body RBRACE
+      {:
+        if (!state.secondrun) {
+          state.cnames.add(n);
+          CDesc cdesc = state.classdescriptor.getOrDefault(n, new CDesc());
+          cdesc.fromBlock(body, bodyxleft, bodyxright, n);
+
+          if (state.classdescriptor.containsKey(n)) {
+            // Duplicate found!
+            Parser.addError(
+              "Class name %s has already been declared!",
+              nxleft,
+              nxright,
+              n
+            );
+          }
+
+          state.classdescriptor.putIfAbsent(n, cdesc);
+        }
+
+        state.classptr++;
+        rst.add(new Node(Node.NodeType.CDecl, new Node(Node.NodeType.CName, n), body));
+        RESULT = rst;
+      :}
+    | /* empty class */
+      {: RESULT = new ArrayList<Node>(); :}
+    ;
+
+class_body ::= /* empty */ {: RESULT = new Node(Node.NodeType.Block); :}
+    | var_decls:vs
+      {: RESULT = new Node(Node.NodeType.Block, vs); :}
+    | md_decls:mds
+     {: RESULT = new Node(Node.NodeType.Block, mds); :}
+    | var_decls:vs md_decls:mds
+      {:
+        vs.addAll(mds);
+        RESULT = new Node(Node.NodeType.Block, vs);
+      :}
+    ;
+
+// Used only by MdBody, so the size of cur_vedecls correspond
+// to local vars.
+var_decls_opt ::=
+    /* nothing */
+      {:
+        state.curVDecls = new HashMap<String, String>();
+        RESULT = new ArrayList<Node>();
+      :}
+    | var_decls:vars
+      {: RESULT = vars; :}
+    ;
+
+var_decls ::=
+    var_decl:v
+      {:
+        state.curVDecls = new HashMap<String, String>();
+        state.curVDecls.put(v.children.get(1).getLabelledValue(), v.children.get(0).data);
+        RESULT = new ArrayList<Node>(Arrays.asList(v));
+      :}
+    | var_decls:rest var_decl:v
+      {:
+        state.curVDecls.put(v.children.get(1).getLabelledValue(), v.children.get(0).data);
+        rest.add(v);
+        RESULT = rest;
+      :}
+    ;
+
+var_decl ::=
+    type:t IDENTIFIER:id SEMICOLON
+      {: RESULT = new Node(Node.NodeType.VDecl, t, new Node(Node.NodeType.Identifier, id)); :}
+    ;
+
+// <MdDecl> -> <Type> <id> ( <FmlList> ) <MdBody>
+md_decls ::= md_decl:v
+      {: RESULT = new ArrayList<Node>(Arrays.asList(v)); :}
+    | md_decls:rest md_decl:v
+      {: rest.add(v); RESULT = rest; :}
+    ;
+
+md_decl ::= type:t IDENTIFIER:id LPAREN fml_list:fml RPAREN md_body:body
+    {:
+      if (!state.secondrun) {
+        state.mnames.add(new Pair<String, String>(id, t.getLabelledValue()));
+      }
+
+      if (state.secondrun) {
+        String rtype = state.typestack.pop();
+
+        if (!rtype.equals(t.data)) {
+          Parser.addError(
+            "%s method expected return type '%s', but got '%s'!",
+            txleft,
+            bodyxright,
+            id,
+            t.data,
+            rtype
+          );
+        }
+      }
+
+      state.methodptr++;
+
+      Node fmlNode = new Node(Node.NodeType.FmlList, fml);
+      Node mname = new Node(Node.NodeType.MName, id);
+      Node method = new Node(Node.NodeType.MDecl, t, mname, fmlNode, body);
+      method.note = String.join("_", t.toString(), Utils.getMsigFromFmlNode(fmlNode));
+
+      RESULT = method; :}
+    ;
+
+md_body ::= LBRACE var_decls_opt:v stmts:s RBRACE
+      {: v.add(s); RESULT = new Node(Node.NodeType.Block, v.toArray(new Node[0])); :}
+    ;
+
+stmts_opt ::= {: state.typestack.push(Utils.ParserTypes.VOID.getValue()); RESULT = new Node(Node.NodeType.Stmts); :}
+    | stmts:s {: RESULT = s; :}
+    ;
+
+stmts ::= stmt:s
+      {:
+        RESULT = new Node(Node.NodeType.Stmts, s);
+      :}
+    | stmts:sts stmt:s
+      {:
+        if (state.secondrun) {
+          String rtype = state.typestack.pop();
+          state.typestack.pollFirst();
+          state.typestack.push(rtype);
+        }
+        sts.add(s); RESULT = sts;
+      :}
+    ;
+
+/*
+<Stmt> -> if ( <Exp>) { <Stmt>+ } else { <Stmt>+ }
+| while (<Exp>) {<Stmt>*}
+| readln (<id>) ; | println(<Exp>) ;
+| <id> = <Exp>; | <Atom>.<id> = <Exp>;
+| <Atom>(<ExpList>) ; | return <Exp>; | return ;
+*/
+stmt ::= IF LPAREN expr:e RPAREN LBRACE stmts:s1 RBRACE ELSE LBRACE stmts:s2 RBRACE
+      {:
+        if (state.secondrun) {
+          String s2type = state.typestack.pop();
+          String s1type = state.typestack.pop();
+          String etype = state.typestack.pop();
+
+          if (etype != Utils.ParserTypes.BOOL.getValue()) {
+            Parser.addError(
+              "If conditin has type %s, expected bool",
+              exleft,
+              exright,
+              etype
+            );
+          } else if (s1type != s2type) {
+            Parser.addError(
+              "If-then block and else block must be of same type! If-then: %s, Else: %s",
+              s1xleft,
+              s2xright,
+              s1type,
+              s2type
+            );
+          }
+
+          state.typestack.push(s2type);
+        }
+
+        RESULT = new Node(Node.NodeType.Cond, e, s1, s2);
+      :}
+    | WHILE LPAREN expr:e RPAREN LBRACE stmts_opt:s1 RBRACE
+      {:
+        if (state.secondrun) {
+          String stype = state.typestack.pop();
+          String etype = state.typestack.pop();
+
+          if (s1.children.size() == 0) {
+            Parser.addError(
+              "While body cannot be empty!",
+              exleft,
+              exright
+            );
+          }
+
+          if (etype != Utils.ParserTypes.BOOL.getValue()) {
+            Parser.addError(
+              "While condition has type %s, expected Bool",
+              exleft,
+              exright,
+              etype
+            );
+          }
+
+          state.typestack.push(stype);
+        }
+
+        RESULT = new Node(Node.NodeType.While, e, s1);
+      :}
+    | READLN LPAREN IDENTIFIER:id RPAREN SEMICOLON
+      {:
+        RESULT = new Node(Node.NodeType.Read, new Node(Node.NodeType.Identifier, id));
+
+        if (state.secondrun) {
+          idMdTypecheck(idxleft, id);
+          String itype = state.typestack.pop();
+
+          if (itype != Utils.ParserTypes.BOOL.getValue() && itype != Utils.ParserTypes.STRING.getValue() && itype != Utils.ParserTypes.INT.getValue()) {
+            Parser.addError(
+              "Readln identifier must be of type bool, string or int! Got %s!",
+              idxleft,
+              idxright,
+              itype
+            );
+          }
+
+          state.typestack.push(Utils.ParserTypes.VOID.getValue());
+        }
+      :}
+    | PRINTLN LPAREN expr:e RPAREN SEMICOLON
+      {:
+        if (state.secondrun) {
+          String etype = state.typestack.pop();
+
+          if (etype != Utils.ParserTypes.BOOL.getValue() && etype != Utils.ParserTypes.STRING.getValue() && etype != Utils.ParserTypes.INT.getValue()) {
+            Parser.addError(
+              "Println argument must be of type bool, string or int! Got %s!",
+              exleft,
+              exright,
+              etype
+            );
+          }
+
+          state.typestack.push(Utils.ParserTypes.VOID.getValue());
+        }
+        RESULT = new Node(Node.NodeType.Print, e); :}
+    | IDENTIFIER:id EQ expr:e SEMICOLON
+      {:
+        Node lNode = new Node(Node.NodeType.Identifier, id);
+        Node rNode = e;
+        if (state.secondrun) {
+          String rtype = state.typestack.pop();
+          idMdTypecheck(idxleft, id);
+          String ltype = state.typestack.pop();
+
+          if (!ltype.equals(rtype) && !rtype.equals("null")) {
+            Parser.addError(
+              "Trying to assign value of type %s to variable %s with type %s",
+              idxleft,
+              exright,
+              rtype,
+              id.toString(),
+              ltype
+            );
+          }
+
+          lNode.note = ltype;
+          rNode.note = rtype;
+
+          state.typestack.push(Utils.ParserTypes.VOID.getValue());
+        }
+
+        if (state.isWithinClass) {
+          // Prepend "this"
+          Node thisNode = new Node(Node.NodeType.This, "this");
+          thisNode.note = state.getCurrentClass();
+          RESULT = new Node(Node.NodeType.FdAss, thisNode, lNode, rNode);
+        } else {
+          RESULT = new Node(Node.NodeType.VarAss, lNode, rNode);
+        }
+      :}
+    | atom:a DOT IDENTIFIER:id EQ expr:e SEMICOLON
+      {:
+        RESULT = new Node(Node.NodeType.FdAss, a, new Node(Node.NodeType.Identifier, id), e);
+
+        if (state.secondrun) {
+          String rtype = state.typestack.pop();
+          clsFdMdTypecheck(axleft, state.typestack.pop(), id);
+          String ltype = state.typestack.pop();
+          if (!ltype.equals(rtype) && !rtype.equals("null")) {
+            Parser.addError(
+              "Trying to assign value of type %s to %s.%s with type %s",
+              axleft,
+              exright,
+              rtype,
+              a.toString(),
+              id.toString(),
+              ltype
+            );
+          }
+
+          state.typestack.push(Utils.ParserTypes.VOID.getValue());
+        }
+      :}
+    | atom:a LPAREN expr_lst:lst RPAREN SEMICOLON
+      {:
+        lst.add(0, a);
+        RESULT = new Node(Node.NodeType.Call, lst.toArray(new Node[0]));
+        if (state.secondrun) {
+          RESULT.note = mdCallTypecheck(RESULT, axleft, lst.size() - 1);
+          RESULT.msig = RESULT.note;
+        }
+      :}
+    | RETURN expr:e SEMICOLON
+      {:
+        if (state.secondrun) {
+          String rtype = state.typestack.pop();
+
+          if (!rtype.equals(state.getCurrentMethodReturnType())) {
+            Parser.addError(
+              "Return expression 'return %s;' is returning type %s, but method expects return type of %s!",
+              exleft,
+              exright,
+              e,
+              rtype,
+              state.getCurrentMethodReturnType()
+            );
+          }
+
+          state.typestack.push(rtype);
+        }
+
+        RESULT = new Node(Node.NodeType.RetT, e);
+      :}
+    | RETURN:r SEMICOLON
+      {:
+        if (state.secondrun) {
+          if (!Utils.ParserTypes.VOID.getValue().equals(state.getCurrentMethodReturnType())) {
+            Parser.addError(
+              "Return expression 'return;' is returning type %s, but method expects return type of %s!",
+              rxleft,
+              rxright,
+              Utils.ParserTypes.VOID.getValue(),
+              state.getCurrentMethodReturnType()
+            );
+          }
+        }
+        state.typestack.push(Utils.ParserTypes.VOID.getValue());
+        RESULT = new Node(Node.NodeType.RetV);
+      :}
+    ;
+
+fml_list ::= type:t IDENTIFIER:id fml_rest:rst
+      {:
+        state.curFml.put(id, t.data);
+        state.fmlTypes.add(t.data);
+        rst.add(0, new Node(Node.NodeType.VDecl, t, new Node(Node.NodeType.Identifier, id)));
+        RESULT = rst;
+      :}
+    | /* none */
+      {:
+        state.curFml = new HashMap<String, String>();
+        state.fmlTypes = new ArrayList<String>();
+        RESULT = new ArrayList<Node>();
+      :}
+    ;
+
+fml_rest ::= COMMA type:t IDENTIFIER:id fml_rest:rst
+      {:
+        state.curFml.put(id, t.data);
+        state.fmlTypes.add(t.data);
+        rst.add(0, new Node(Node.NodeType.VDecl, t, new Node(Node.NodeType.Identifier, id)));
+        RESULT = rst;
+      :}
+    | /* no more */
+      {:
+        state.curFml = new HashMap<String, String>();
+        state.fmlTypes = new ArrayList<String>();
+        RESULT = new ArrayList<Node>();
+      :}
+    ;
+
+type ::= TINT {: RESULT = new Node(Node.NodeType.Type, Utils.ParserTypes.INT.getValue()); :}
+    | TBOOL {: RESULT = new Node(Node.NodeType.Type, Utils.ParserTypes.BOOL.getValue()); :}
+    | TSTRING {: RESULT = new Node(Node.NodeType.Type, Utils.ParserTypes.STRING.getValue()); :}
+    | TVOID {: RESULT = new Node(Node.NodeType.Type, Utils.ParserTypes.VOID.getValue()); :}
+    | CNAME:n {: RESULT = new Node(Node.NodeType.Type, n); :}
+    ;
+
+expr_lst ::= /* nothing */ {: RESULT = new ArrayList<Node>(); :}
+    | expr:e expr_rest:lst {: lst.add(0, e); RESULT = lst; :}
+    ;
+
+expr_rest ::= COMMA expr:e expr_rest:lst
+     {: lst.add(0, e); RESULT = lst; :}
+    | /* no more */ {: RESULT = new ArrayList<Node>(); :}
+    ;
+
+expr ::= aexpr:e {: RESULT = e; :}
+    | bexpr: e   {: RESULT = e; :}
+    | sexpr:e    {: RESULT = e; :}
+    ;
+
+aexpr_list ::= aexpr_loop:a PLUS aexpr_loop:b
+      {:
+        RESULT = new Node(Node.NodeType.Arith, a, new Node(Node.NodeType.AOp, "+"), b);
+
+        if (state.secondrun) {
+          arithTypecheck(RESULT, axleft, Utils.ParserTypes.INT.getValue());
+          RESULT.note = Utils.ParserTypes.INT.getValue();
+        }
+      :}
+    | aexpr_loop:a MINUS aexpr_loop:b
+      {:
+        RESULT = new Node(Node.NodeType.Arith, a, new Node(Node.NodeType.AOp, "-"), b);
+
+        if (state.secondrun) {
+          arithTypecheck(RESULT, axleft, Utils.ParserTypes.INT.getValue());
+          RESULT.note = Utils.ParserTypes.INT.getValue();
+        }
+      :}
+    | aexpr_loop:a TIMES aexpr_loop:b
+      {:
+        RESULT = new Node(Node.NodeType.Arith, a, new Node(Node.NodeType.AOp, "*"), b);
+
+        if (state.secondrun) {
+          arithTypecheck(RESULT, axleft, Utils.ParserTypes.INT.getValue());
+          RESULT.note = Utils.ParserTypes.INT.getValue();
+        }
+      :}
+    | aexpr_loop:a DIV aexpr_loop:b
+      {:
+        RESULT = new Node(Node.NodeType.Arith, a, new Node(Node.NodeType.AOp, "/"), b);
+
+        if (state.secondrun) {
+          arithTypecheck(RESULT, axleft, Utils.ParserTypes.INT.getValue());
+          RESULT.note = Utils.ParserTypes.INT.getValue();
+        }
+      :}
+    ;
+
+aexpr ::= aexpr_list:a {: RESULT = a; :}
+    | ftr_no_atom:t    {: RESULT = t; :}
+    ;
+
+aexpr_loop ::= aexpr_list:a {: RESULT = a; :}
+    | ftr:t                  {: RESULT = t; :}
+    ;
+
+ftr ::= ftr_no_atom:a {: RESULT = a; :}
+    | atom:a {: RESULT = a; :}
+    ;
+
+ftr_no_atom ::= INTCONST:i
+      {:
+        RESULT = new Node(Node.NodeType.Integer, Integer.toString(i));
+
+        if (state.secondrun) {
+          RESULT.note = "int";
+          state.typestack.push(Utils.ParserTypes.INT.getValue());
+        }
+      :}
+    | MINUS ftr:f
+      {:
+        RESULT = new Node(Node.NodeType.INeg, f);
+        RESULT.note = Utils.ParserTypes.INT.getValue();
+      :}  %prec UMINUS
+    ;
+
+sexpr ::= STRINGLITERAL:s
+      {:
+        state.typestack.push(Utils.ParserTypes.STRING.getValue());
+        RESULT = new Node(Node.NodeType.Str, s);
+      :}
+    | atom:a              {: RESULT = a; :}
+    ;
+
+bexpr ::= bexpr_list:a {: RESULT = a; :}
+    | rexpr_no_atom:a {: RESULT = a; :}
+    ;
+
+bexpr_list ::= bexpr_loop:a BOR bexpr_loop:b
+      {:
+        RESULT = new Node(Node.NodeType.BExpr, a, new Node(Node.NodeType.BOp, "||"), b);
+
+        if (state.secondrun) {
+          RESULT.note = boolTypecheck(
+            RESULT,
+            axleft
+          );
+        }
+      :}
+    | bexpr_loop:a BAND bexpr_loop:b
+      {:
+        RESULT = new Node(Node.NodeType.BExpr, a, new Node(Node.NodeType.BOp, "&&"), b);
+
+        if (state.secondrun) {
+          RESULT.note = boolTypecheck(
+            RESULT,
+            axleft
+          );
+        }
+      :}
+    ;
+
+bexpr_loop ::= bexpr_list:a {: RESULT = a; :}
+    | rexpr:a {: RESULT = a; :}
+    ;
+
+aexpr_or_atom ::= aexpr:a {: RESULT = a; :}
+    | atom:a {: RESULT = a; :}
+    ;
+
+bopexpr ::= aexpr_or_atom:a bop:op aexpr_or_atom:b
+      {:
+        RESULT = new Node(Node.NodeType.Rel, a, op, b);
+
+        if (state.secondrun) {
+          arithTypecheck(RESULT, axleft, Utils.ParserTypes.BOOL.getValue());
+          RESULT.note = Utils.ParserTypes.BOOL.getValue();
+        }
+      :}
+    ;
+
+rexpr ::= bopexpr:a {: RESULT = a; :}
+    | bgrd:a {: RESULT = a; :}
+    ;
+
+rexpr_no_atom ::= bopexpr:a {: RESULT = a; :}
+    | bgrd_no_atom:a {: RESULT = a; :}
+    ;
+
+bgrd ::= bgrd_no_atom:a {: RESULT = a; :}
+    | atom:a {: RESULT = a; :}
+    ;
+
+bgrd_truths ::= TRUE
+      {:
+        if (state.secondrun) {
+          state.typestack.push(Utils.ParserTypes.BOOL.getValue());
+        }
+        RESULT = new Node(Node.NodeType.BGrd, "true");
+      :}
+    | FALSE
+      {:
+        if (state.secondrun) {
+          state.typestack.push(Utils.ParserTypes.BOOL.getValue());
+        }
+
+        RESULT = new Node(Node.NodeType.BGrd, "false");
+      :}
+    ;
+
+bgrd_no_atom ::= NOT bgrd_not_loop:a
+      {:
+        RESULT = new Node(Node.NodeType.BNeg, a);
+        RESULT.note = Utils.ParserTypes.BOOL.getValue();
+      :}
+    | bgrd_truths:a {: RESULT = a; :}
+    ;
+
+bgrd_not_loop ::= NOT bgrd_not_loop:a
+      {:
+        RESULT = new Node(Node.NodeType.BNeg, a);
+        RESULT.note = Utils.ParserTypes.BOOL.getValue();
+      :}
+    | bgrd_truths:a {: RESULT = a; :}
+    | atom:a {: RESULT = a; :}
+    ;
+
+bop ::= LT {: RESULT = new Node(Node.NodeType.BOp, "<"); :}
+    | GT {: RESULT = new Node(Node.NodeType.BOp, ">"); :}
+    | LEQ  {: RESULT = new Node(Node.NodeType.BOp, "<="); :}
+    | GEQ  {: RESULT = new Node(Node.NodeType.BOp, ">="); :}
+    | DEQ  {: RESULT = new Node(Node.NodeType.BOp, "=="); :}
+    | NEQ  {: RESULT = new Node(Node.NodeType.BOp, "!="); :}
+    ;
+
+atom ::= atom:a DOT IDENTIFIER:id
+      {:
+        RESULT = new Node(Node.NodeType.Field, a, new Node(Node.NodeType.Identifier, id));
+
+        if (state.secondrun) {
+          RESULT.note = clsFdMdTypecheck(axleft, state.typestack.pop(), id);
+        }
+      :}
+    | atom:a LPAREN expr_lst:lst RPAREN
+      {:
+        lst.add(0, a);
+        RESULT = new Node(Node.NodeType.Call, lst.toArray(new Node[0]));
+
+        if (state.secondrun) {
+          RESULT.note = mdCallTypecheck(RESULT, axleft, lst.size() - 1);
+          RESULT.msig = RESULT.note;
+        }
+      :}
+    | THIS
+      {:
+        RESULT = new Node(Node.NodeType.This, "this");
+
+        if (state.secondrun) {
+          state.typestack.push(state.getCurrentClass());
+          RESULT.note = state.getCurrentClass();
+        }
+      :}
+    | IDENTIFIER:id
+      {:
+        RESULT = new Node(Node.NodeType.Identifier, id);
+
+        if (state.secondrun) {
+          RESULT.note = idMdTypecheck(idxleft, id);
+          if (state.isWithinClass) {
+            // Prepend ID
+            Node thisNode = new Node(Node.NodeType.This, "this");
+            thisNode.note = state.getCurrentClass();
+
+            Node fieldNode = new Node(Node.NodeType.Field, thisNode, RESULT);
+            fieldNode.note = RESULT.note;
+            RESULT = fieldNode;
+          }
+        }
+      :}
+    | NEW CNAME:c LPAREN RPAREN
+      {:
+        if (state.secondrun) {
+          state.typestack.push(c);
+
+          if (!state.classdescriptor.containsKey(c)) {
+            state.typestack.push(c);
+            Parser.addError(
+              "Trying to create new instance of non-existent class %s!",
+              cxleft,
+              cxright,
+              c
+            );
+          }
+        }
+        RESULT = new Node(Node.NodeType.New, new Node(Node.NodeType.CName, c));
+        RESULT.note = c;
+      :}
+    | LPAREN expr:e RPAREN {:
+      RESULT = new Node(Node.NodeType.Expr, e);
+      if (state.secondrun) {
+        RESULT.note = state.typestack.pop();
+        state.typestack.push(RESULT.note);
+      }
+    :}
+    | NULL
+      {:
+        if (state.secondrun) {
+          state.typestack.push("null");
+        }
+        RESULT = new Node(Node.NodeType.Null, "null");
+      :}
+    ;
